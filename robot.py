@@ -1,6 +1,7 @@
 import pybullet as p
 import math
 from collections import namedtuple
+import numpy as np
 
 
 class RobotBase(object):
@@ -8,7 +9,7 @@ class RobotBase(object):
     The base class for robots
     """
 
-    def __init__(self, pos, ori):
+    def __init__(self, pos, ori, control_mode="position"):
         """
         Arguments:
             pos: [x y z]
@@ -35,6 +36,7 @@ class RobotBase(object):
         """
         self.base_pos = pos
         self.base_ori = p.getQuaternionFromEuler(ori)
+        self.control_mode = control_mode
 
     def load(self):
         self.__init_robot__()
@@ -76,12 +78,24 @@ class RobotBase(object):
         assert len(self.controllable_joints) >= self.arm_num_dofs
         self.arm_controllable_joints = self.controllable_joints[:self.arm_num_dofs]
 
-        self.arm_lower_limits = [
-            info.lowerLimit for info in self.joints if info.controllable][:self.arm_num_dofs]
-        self.arm_upper_limits = [
-            info.upperLimit for info in self.joints if info.controllable][:self.arm_num_dofs]
-        self.arm_joint_ranges = [
-            info.upperLimit - info.lowerLimit for info in self.joints if info.controllable][:self.arm_num_dofs]
+        self.arm_lower_limits = np.array([
+            info.lowerLimit for info in self.joints if info.controllable][:self.arm_num_dofs])
+        self.arm_upper_limits = np.array([
+            info.upperLimit for info in self.joints if info.controllable][:self.arm_num_dofs])
+        self.arm_joint_ranges = np.array([
+            info.upperLimit - info.lowerLimit for info in self.joints if info.controllable][:self.arm_num_dofs])
+        self.arm_torque_limits = np.array([
+            info.maxForce for info in self.joints if info.controllable][:self.arm_num_dofs])
+
+        # for scale
+        self.joint_pos_mean = (self.arm_upper_limits +
+                               self.arm_lower_limits) / 2.
+        self.joint_pos_std = (self.arm_upper_limits -
+                              self.arm_lower_limits) / 2.
+
+        for joint_id in self.controllable_joints:
+            p.enableJointForceTorqueSensor(
+                self.id, joint_id, enableSensor=True)
 
     def __init_robot__(self):
         raise NotImplementedError
@@ -108,13 +122,13 @@ class RobotBase(object):
         self.open_gripper()
 
     def open_gripper(self):
-        self.move_gripper(self.gripper_range[1])
-
-    def close_gripper(self):
         self.move_gripper(self.gripper_range[0])
 
-    def move_ee(self, action, control_method):
-        assert control_method in ('joint', 'end')
+    def close_gripper(self):
+        self.move_gripper(self.gripper_range[1])
+
+    def apply_arm_action(self, action, control_method):
+        assert control_method in ('position', 'torque', 'end')
         if control_method == 'end':
             x, y, z, roll, pitch, yaw = action
             pos = (x, y, z)
@@ -122,75 +136,65 @@ class RobotBase(object):
             joint_poses = p.calculateInverseKinematics(self.id, self.eef_id, pos, orn,
                                                        self.arm_lower_limits, self.arm_upper_limits, self.arm_joint_ranges, self.arm_rest_poses,
                                                        maxNumIterations=20)
-        elif control_method == 'joint':
+            for i, joint_id in enumerate(self.arm_controllable_joints):
+                p.setJointMotorControl2(self.id, joint_id, p.POSITION_CONTROL, joint_poses[i],
+                                        force=self.joints[joint_id].maxForce, maxVelocity=self.joints[joint_id].maxVelocity, positionGain=self.Kp_arm[i], velocityGain=self.Kd_arm[i])
+        elif control_method == 'position':
             assert len(action) == self.arm_num_dofs
-            joint_poses = action
-        # arm
-        for i, joint_id in enumerate(self.arm_controllable_joints):
-            p.setJointMotorControl2(self.id, joint_id, p.POSITION_CONTROL, joint_poses[i],
-                                    force=self.joints[joint_id].maxForce, maxVelocity=self.joints[joint_id].maxVelocity)
+            joint_poses = self.joint_pos_mean + self.joint_pos_std * action
+            for i, joint_id in enumerate(self.arm_controllable_joints):
+                p.setJointMotorControl2(self.id, joint_id, p.POSITION_CONTROL, joint_poses[i],
+                                        force=self.joints[joint_id].maxForce, maxVelocity=self.joints[joint_id].maxVelocity, positionGain=self.Kp_arm[i], velocityGain=self.Kd_arm[i])
+        elif control_method == 'torque':
+            assert len(action) == self.arm_num_dofs
+            torques = self.arm_torque_limits * self.action_scale * action
+            torques = np.clip(
+                torques, a_min=-1.*self.arm_torque_limits, a_max=self.arm_torque_limits)
+            for i, joint_id in enumerate(self.arm_controllable_joints):
+                p.setJointMotorControl2(
+                    self.id, joint_id, p.TORQUE_CONTROL, force=torques[joint_id])
+        else:
+            raise NotImplementedError
 
     def move_gripper(self, open_length):
         raise NotImplementedError
 
-    def get_joint_obs(self):
+    def get_robot_obs(self):
         positions = []
         velocities = []
-        for joint_id in self.controllable_joints:
-            pos, vel, _, _ = p.getJointState(self.id, joint_id)
+        torques = []
+        # for joint_id in self.controllable_joints:
+        for joint_id in self.arm_controllable_joints:
+            pos, vel, _, torque = p.getJointState(self.id, joint_id)
             positions.append(pos)
             velocities.append(vel)
-        ee_pos = p.getLinkState(self.id, self.eef_id)[0]
-        return dict(positions=positions, velocities=velocities, ee_pos=ee_pos)
+            torques.append(torque)
+        ee_pos, ee_ori, _, _, _, _, ee_lin_vel, ee_ang_vel = p.getLinkState(
+            self.id, self.eef_id, computeLinkVelocity=True)
+        return dict(positions=positions, velocities=velocities, torques=torques, ee_pos=ee_pos, ee_ori=ee_ori, ee_lin_vel=ee_lin_vel, ee_ang_vel=ee_ang_vel)
 
 
-class Panda(RobotBase):
-    def __init_robot__(self):
-        # define the robot
-        # see https://github.com/bulletphysics/bullet3/blob/master/examples/pybullet/gym/pybullet_robots/panda/panda_sim_grasp.py
-        self.eef_id = 11
-        self.arm_num_dofs = 7
-        self.arm_rest_poses = [0.98, 0.458, 0.31, -2.24, -0.30, 2.66, 2.32]
-        self.id = p.loadURDF('./urdf/panda.urdf', self.base_pos, self.base_ori,
-                             useFixedBase=True, flags=p.URDF_ENABLE_CACHED_GRAPHICS_SHAPES)
-        self.gripper_range = [0, 0.04]
-        # create a constraint to keep the fingers centered
-        c = p.createConstraint(self.id,
-                               9,
-                               self.id,
-                               10,
-                               jointType=p.JOINT_GEAR,
-                               jointAxis=[1, 0, 0],
-                               parentFramePosition=[0, 0, 0],
-                               childFramePosition=[0, 0, 0])
-        p.changeConstraint(c, gearRatio=-1, erp=0.1, maxForce=50)
-
-    def move_gripper(self, open_length):
-        assert self.gripper_range[0] <= open_length <= self.gripper_range[1]
-        for i in [9, 10]:
-            p.setJointMotorControl2(
-                self.id, i, p.POSITION_CONTROL, open_length, force=20)
-
-
-class UR5Robotiq85(RobotBase):
+class KinovaRobotiq140(RobotBase):
     def __init_robot__(self):
         self.eef_id = 7
-        self.arm_num_dofs = 6
-        self.arm_rest_poses = [-1.5690622952052096, -1.5446774605904932, 1.343946009733127, -1.3708613585093699,
-                               -1.5707970583733368, 0.0009377758247187636]
-        self.id = p.loadURDF('./urdf/ur5_robotiq_85.urdf', self.base_pos, self.base_ori,
+        self.arm_num_dofs = 7
+        # self.arm_rest_poses = [0.98, 0.458, 0.31, -2.24, -0.30, 2.66, 2.32]
+        self.arm_rest_poses = np.array(
+            [0, 0.1963, 0, -2.6180, 0, 2.9416, 0.7854, 0.035, 0.035])
+        # self.arm_rest_poses = np.array([0., 0., 0., 0., 0., 0., 0.])
+        self.id = p.loadURDF('./urdf/gen3_robotiq_2f_140.urdf', self.base_pos, self.base_ori,
                              useFixedBase=True, flags=p.URDF_ENABLE_CACHED_GRAPHICS_SHAPES)
-        self.gripper_range = [0, 0.085]
+        # self.gripper_range = [0, 0.085]
+        self.gripper_range = [-1.0, 1.0]
+        # TODO: It's weird to use the same range and the same formula to calculate open_angle as Robotiq85.
+        self.actions_scale = 1.0
+        self.Kp_arm = np.array(
+            [3000., 50000., 3000., 50000., 750., 5000., 100.])
+        self.Kd_arm = np.array([2., 0., 0., 0., 0.2, 1., 0.])
 
-    def __post_load__(self):
-        # To control the gripper
-        mimic_parent_name = 'finger_joint'
-        mimic_children_names = {'right_outer_knuckle_joint': 1,
-                                'left_inner_knuckle_joint': 1,
-                                'right_inner_knuckle_joint': 1,
-                                'left_inner_finger_joint': -1,
-                                'right_inner_finger_joint': -1}
-        self.__setup_mimic_joints__(mimic_parent_name, mimic_children_names)
+        # arm joint limits
+        # [-3.141592 -2.41     -3.141592 -2.66     -3.141592 -2.23     -3.141592]
+        # [3.141592 2.41     3.141592 2.66     3.141592 2.23     3.141592]
 
     def __setup_mimic_joints__(self, mimic_parent_name, mimic_children_names):
         self.mimic_parent_id = [
@@ -208,45 +212,18 @@ class UR5Robotiq85(RobotBase):
             # Note: the mysterious `erp` is of EXTREME importance
             p.changeConstraint(c, gearRatio=-multiplier, maxForce=100, erp=1)
 
-    def move_gripper(self, open_length):
-        # open_length = np.clip(open_length, *self.gripper_range)
-        # angle calculation
-        open_angle = 0.715 - math.asin((open_length - 0.010) / 0.1143)
+    def move_gripper(self, action):
+        # action to gripper angle
+        gripper_upper_limit = self.joints[self.mimic_parent_id].upperLimit
+        gripper_lower_limit = self.joints[self.mimic_parent_id].lowerLimit
+        gripper_std = (gripper_upper_limit - gripper_lower_limit) / 2.
+        gripper_mean = (gripper_upper_limit + gripper_lower_limit) / 2.
+        # open_angle = 0.715 - math.asin((open_length - 0.010) / 0.1143)
+        open_angle = gripper_mean + gripper_std * action
+
         # Control the mimic gripper joint(s)
         p.setJointMotorControl2(self.id, self.mimic_parent_id, p.POSITION_CONTROL, targetPosition=open_angle,
                                 force=self.joints[self.mimic_parent_id].maxForce, maxVelocity=self.joints[self.mimic_parent_id].maxVelocity)
-
-
-class UR5Robotiq140(UR5Robotiq85):
-    def __init_robot__(self):
-        self.eef_id = 7
-        self.arm_num_dofs = 6
-        self.arm_rest_poses = [0.98, 0.458, 0.31, -2.24, -0.30, 2.66, 2.32]
-        self.id = p.loadURDF('./urdf/ur5_robotiq_140.urdf', self.base_pos, self.base_ori,
-                             useFixedBase=True, flags=p.URDF_ENABLE_CACHED_GRAPHICS_SHAPES)
-        self.gripper_range = [0, 0.085]
-        # TODO: It's weird to use the same range and the same formula to calculate open_angle as Robotiq85.
-
-    def __post_load__(self):
-        mimic_parent_name = 'finger_joint'
-        mimic_children_names = {'right_outer_knuckle_joint': -1,
-                                'left_inner_knuckle_joint': -1,
-                                'right_inner_knuckle_joint': -1,
-                                'left_inner_finger_joint': 1,
-                                'right_inner_finger_joint': 1}
-        self.__setup_mimic_joints__(mimic_parent_name, mimic_children_names)
-
-
-class KinovaRobotiq140(UR5Robotiq85):
-    def __init_robot__(self):
-        self.eef_id = 7
-        self.arm_num_dofs = 7
-        # self.arm_rest_poses = [0.98, 0.458, 0.31, -2.24, -0.30, 2.66, 2.32]
-        self.arm_rest_poses = [0., 0., 0., 0., 0., 0., 0.]
-        self.id = p.loadURDF('./urdf/gen3_robotiq_2f_140.urdf', self.base_pos, self.base_ori,
-                             useFixedBase=True, flags=p.URDF_ENABLE_CACHED_GRAPHICS_SHAPES)
-        self.gripper_range = [0, 0.085]
-        # TODO: It's weird to use the same range and the same formula to calculate open_angle as Robotiq85.
 
     def __post_load__(self):
         mimic_parent_name = 'finger_joint'
